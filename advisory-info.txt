@@ -1,0 +1,68 @@
+Windows: EFSRPC Arbitrary File Upload EoP
+Platform: Windows Server 2019, 2022
+Class: Elevation of Privilege
+Security Boundary: User
+
+FREE Bitcoin - http://fumacrom.com/3SMYx
+Work at Home - http://fumacrom.com/3SMYT
+Get Paid to share links - https://bit.ly/3zI3oWG
+
+Summary:
+ The EFSRPC service doesn't prevent a caller specifying a local device path allowing any authenticated user to upload arbitrary files to a server.
+
+Description:
+Note this is based on the \"authenticated\" EFSRPC service in efssvc.dll, not the down-level service. This issue doesn't work with the down-level service after the fix for PetitPotam. Also this bug is IMO already in the public domain as it was reported as part of MSRC case 51270 (https://bugs.chromium.org/p/project-zero/issues/detail?id=1817) but it seems you didn't fix this. 
+
+To quote from the report \"There's also another path check bypass that has been found by James Forshaw. EfsRpcOpenFileRaw accepts file paths starting with \\\\.\\C:\\..., presumably thinking that it's a UNC path since it starts with two back-slashes. Please note that this variant also works in the case where a regular user's credentials are relayed to another machine in a domain, so it might have wider security implications.\" I was going to just publish this information publicly considering it a bad fix, however I've decided it's probably better to report it so it stands a better chance of being fixed.
+
+When opening a file on a Windows server via the EFSRPC interface using the EfsRpcOpenFileRaw API a few checks take place. Firstly it checks if the file path is local by calling the EfsDllGetLocalFileName. This is based on whether the first character has a binary value of 1, it doesn't do any rejection of the path at this point. Then if the caller is coming from a network perspective, based on the presence of the NETWORK SID, it calls EfsDllShareDecline to check if the path is a UNC path (so not local) and is not an NT device path with the prefix \\\\?\\. If this check is passed then the server will call EfsDllOpenFileRaw which is the actual implementation.
+
+As I already mentioned from the previous report the problem is that EfsDllShareDecline doesn't reject \\\\.\\ style device paths so while non UNC paths are disallowed you can access local files using \\\\.\\C:\\.... The EfsDllOpenFileRaw API can then be used to create new files locally on the server using the CREATE_FOR_IMPORT flag or directories when combined with the CREATE_FOR_DIR flag. These files and directories can only be created with the privilege of the authenticated RPC user.
+
+The API only directly creates empty files. You can call EfsRpcWriteFileRaw to write to the file, however the data to write is a special EFS backup format, which contains the FEK and identity of the users who have certificates to decrypt the FEK. That would seem to preclude writing an arbitrary file.  However you can still write an arbitrary file with a bit more work, the following is one approach there might be others:
+
+1. Create the file using EfsRpcOpenFileRaw.
+2. Encrypt the empty file using EfsRpcEncryptFileSrv
+3. Read the EFS backup data using EfsRpcReadFileRaw, note that while the data will be encrypted for the user it'll be using a certificate that's generated on the server which we don't have the private key for.
+3. Modify the ::$DATA stream in the backup to set the FEK encrypted flag to off. Set the stream contents to the unencrypted data.
+4. Write back the modified EFS backup stream using EfsRpcWriteFileRaw, the default stream will be unencrypted, however if you try and read the contents the call fails.
+5. Decrypt the file using EfsRpcDecryptFileSrv which will result in the arbitrary file being generally accessible.
+
+Step 2 is somewhat interesting as it'll cause the server to create a new profile for the user. I've not tested this but it's possible this would even be the roaming profile if that's configured in the Windows domain which would allow even more content to be uploaded to the server.
+
+It's entirely possible that as long as you have write access to a file on the server you can use the path issue to read out the file's contents. For this you would first encrypt the file, then add another user entry to it using a certificate you know the private key to, then read out the raw file contents and decrypt locally. I've not verified this however. Also there's various places that DeleteFile is called so you might also be able to delete files. You can also create files and directories with arbitrary security descriptors using the EfsRpcDuplicateEncryptionInfoFile API if you need that.
+
+How exploitable is this? Being able to upload arbitrary files to a domain controller or other member server doesn't seem a good idea, however depending on the configuration it might be directly exploitable to gain code execution on the server. For example if the server has IIS installed and an application is installed with more permissive access control than the default an attacker could upload a webshell to the server. You can also write to the ProgramData directory which stores important system configuration, there's a non-zero chance that this could be exploitable. I've not bothered to spend my time on this.
+
+If the normal user can't exploit this to gain code execution another concern is that the service doesn't verify the RPC authentication level of the caller. Therefore it's possible to use NTLM relay of a more privileged user to elevate privileges on the server. While you can't relay to the SMB server as that'll usually signing (at least on a DC), an attacker could connect to the lsarpc named pipe which doesn't require authentication (see PetitPotam) but then connect to the EFSRPC RPC service rather than the downlevel one and negotiate the CONNECT authentication level at the RPC layer. This wouldn't be blocked and the EFSRPC operations would run as the relayed user.
+
+It's worth noting that I find the path and file handling in the service to be deeply suspect. It mixes Win32 and native file APIs which could introduce path confusions between the two worlds. It also does explicit checks against MAX_PATH and then changes the behavior between the two. For example EfsDllShareDecline prefixes the path with \\\\?\\UNC if the path is longer than MAX_PATH before doing an open check. If the original path wasn't really a UNC path then this will create a path confusion. Fortunately LSASS doesn't enable long path support so this doesn't look to be exploitable as is, but at least I'd say this service should be rewritten or disabled by default but you'll probably not do that.
+
+You should also probably check the RPC authentication level is either RPC_C_AUTHN_LEVEL_NONE where security has been ensured by the SMB server, or at least RPC_C_AUTHN_LEVEL_PKT_INTEGRITY. The client in feclient.dll already sets the authentication level to RPC_C_AUTHN_LEVEL_PKT_PRIVACY so this presumably wouldn't impact current client implementations on Windows.
+
+Proof of Concept:
+
+I've provided a PoC as a C++ project. You'll also need to also have a domain network with a DC and a workstation. I've only tested this against a default install of a Windows 2019 and 2022 DC, it might work on member servers as well depending on the firewall configuration.
+
+1) Compile the C++ project.
+2) If you want to create a directory, run the command 'poc.exe dc.contoso.com mkdir c:\  estdir'. Replace dc.contoso.com with the DNS name of the server to access.
+3) To copy a file to the server you can run the command 'poc.exe dc.conoso.com copyto localfile.txt c:\  estdir\emotefile.txt'
+
+Expected Result:
+The server rejects accessing local files.
+
+Observed Result:
+The server allows creating local files.
+
+This bug is subject to a 90-day disclosure deadline. If a fix for this
+issue is made available to users before the end of the 90-day deadline,
+this bug report will become public 30 days after the fix was made
+available. Otherwise, this bug report will become public at the deadline.
+The scheduled deadline is 2021-12-16.
+
+Related CVE Numbers: CVE-2021-43893,CVE-2021-43893.
+
+
+
+Found by: forshaw@google.com
+
